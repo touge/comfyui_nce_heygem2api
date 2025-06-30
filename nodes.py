@@ -4,25 +4,14 @@ import requests
 import torchaudio
 import soundfile as sf
 from urllib.parse import urljoin
+import uuid
+from datetime import datetime
 
 from .heygem_client import HeygemApiClient
-from .utils import audio_to_tensor, video_to_tensor
+from .utils import cache_audio, video_to_tensor, cache_video_bytes, prepare_cache_dir
 
-import folder_paths
-temp_dir = folder_paths.get_temp_directory()
-TEMP_DIR = os.path.join(temp_dir, 'heygem')
-os.makedirs(os.path.join(TEMP_DIR, 'temp'), exist_ok=True)
-
-
-
-print(f"🐍 Heygem Generate Video Api Node folder_paths:{folder_paths.get_temp_directory()}")
-
-TEMP_DIR = os.path.join(folder_paths.get_temp_directory(), 'heygem')
-
-print(f"🐍 folder_paths.get_temp_directory: {folder_paths.get_temp_directory()}")
-
-os.makedirs(TEMP_DIR, exist_ok=True)
-print(f"🐍 Heygem Generate Video Api Node Initialized, using temp dir: {TEMP_DIR}")
+cache_dir = os.path.join(os.path.dirname(__file__), "cache")
+prepare_cache_dir(cache_dir)
 
 CATEGORY = "🐍 NCE/Heygem4API"
 
@@ -46,7 +35,6 @@ class NCEHeygemConfigure:
         base = f"{host}:{api_port}/" if host.startswith("http") else f"http://{host}:{api_port}/"
         return ({"api_base": base, "api_key": api_key},)
 
-
 class NCEHeygemGenerateVideo:
     @classmethod
     def INPUT_TYPES(cls):
@@ -59,20 +47,24 @@ class NCEHeygemGenerateVideo:
         }
 
     RETURN_TYPES = ("IMAGE",)
-    RETURN_NAME = ("VIDEO",)  # Changed to VIDEO to match the output type
+    RETURN_NAME = ("VIDEO",)
     FUNCTION     = "process"
     CATEGORY     = CATEGORY
 
     def process(self, ApiConfigure, character_name, audio):
-        client = HeygemApiClient(ApiConfigure)
-        character_name = self._normalize_character_name(character_name)
+        try:
+            client = HeygemApiClient(ApiConfigure)
+            character_name = self._normalize_character_name(character_name)
 
-        audio_path = self._cache_audio(audio)
-        task_code  = self._submit_generation_task(client, character_name, audio_path)
-        result_rel_path = self._wait_for_video(client, task_code)
-        video_tensor = self._download_and_decode_video(client, result_rel_path)
+            audio_path = self._cache_audio(audio)
+            task_code = self._submit_generation_task(client, character_name, audio_path)
+            result_rel_path = self._wait_for_video(client, task_code)
+            video_tensor = self._download_and_decode_video(client, result_rel_path)
 
-        return (video_tensor,)
+            return (video_tensor,)
+        finally:
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
 
     def _normalize_character_name(self, name: str) -> str:
         name = name.strip()
@@ -81,12 +73,13 @@ class NCEHeygemGenerateVideo:
         return name
 
     def _cache_audio(self, audio_data) -> str:
-        return audio_to_tensor(
-            cache_dir=os.path.join(os.path.dirname(__file__), "cache"),
-            audio_tensor=audio_data["waveform"],
-            sample_rate=int(audio_data["sample_rate"]),
-            filename_prefix="heygem_audio_cache_",
-            audio_format=".wav"
+        # cache_dir = os.path.join(os.path.dirname(__file__), "cache", "audio")
+        return cache_audio(
+            cache_dir= cache_dir,
+            audio_tensor= audio_data["waveform"],
+            sample_rate= int(audio_data["sample_rate"]),
+            filename_prefix= "heygem_audio_cache_",
+            audio_format= ".wav"
         )
 
     def _submit_generation_task(self, client: HeygemApiClient, character_name, audio_path) -> str:
@@ -118,101 +111,95 @@ class NCEHeygemGenerateVideo:
 
     def _download_and_decode_video(self, client: HeygemApiClient, result_path: str):
         response = client.get(f"video?path={result_path}", stream=True)
+        response.raise_for_status()
 
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            temp_path = tmp.name
-            try:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        tmp.write(chunk)
-            except Exception as e:
-                raise RuntimeError(f"视频下载失败") from e
+        # 统一缓存目录
+        # cache_dir = os.path.join(os.path.dirname(__file__), "cache")
+        video_bytes = b''.join(response.iter_content(chunk_size=8192))
+        print(f"[Heygem] 下载视频字节流成功，大小: {len(video_bytes)} bytes")
+        video_path = cache_video_bytes(
+            video_bytes= video_bytes,
+            cache_dir= cache_dir,
+        )
+        try:
+            return video_to_tensor(video_path)
+        finally:
+            if os.path.exists(video_path):
+                os.remove(video_path)
+
+class NCEHeygemCharacters:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ApiConfigure": ("ApiConfigure", {"forceInput": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "process"
+    CATEGORY = CATEGORY
+
+    def process(self, ApiConfigure):
+        client = HeygemApiClient(ApiConfigure)
+        try:
+            resp = client.get("characters", timeout=(3, 15))
+            resp.raise_for_status()
+            characters = resp.json()
+            print(f"[Characters] raw list: {repr(characters)}")
+        except Exception as e:
+            print(f"[Characters] 请求异常: {e}")
+            characters = []
+
+        # 拼接 character_name 字段
+        names = [c.get("character_name", "") for c in characters if isinstance(c, dict)]
+        result_text = "\n".join(names) if names else "（没有发现任何角色）"
+        return (result_text,)
+
+
+class NCEHeygemUploadCharacter:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ApiConfigure":   ("ApiConfigure", {"forceInput": True}),
+                "character_name": ("STRING", {"default": "老师"}),
+                "video":          ("VIDEO", {"forceInput": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "process"
+    CATEGORY = CATEGORY
+
+    def process(self, ApiConfigure, character_name, video):
+        # ⬇️ 内联的辅助函数
+        def _extract_video_file_path(video_obj):
+            path = getattr(video_obj, "_VideoFromFile__file", None)
+            return path if isinstance(path, str) else None
+
+        client = HeygemApiClient(ApiConfigure)
+        video_path = _extract_video_file_path(video)
+
+        if not video_path or not os.path.exists(video_path):
+            return (f"[UploadCharacter] 无效的视频文件路径: {video_path}",)
+
+        if not character_name.strip():
+            return (f"[UploadCharacter] 角色名称不能为空",)
+
+        data = {
+            "name": character_name
+        }
 
         try:
-            return video_to_tensor(temp_path)
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            with open(video_path, "rb") as f:
+                files = {
+                    "video_file": (os.path.basename(video_path), f, "video/mp4")
+                }
+                resp = client.post("characters/upload", data=data, files=files, timeout=(5, 60))
+                resp.raise_for_status()
+                result = resp.json()
+                return (f"上传成功：{result.get('character_name', character_name)}",)
 
-
-# class NCEHeygem2apiSpeakers:
-#     @classmethod
-#     def INPUT_TYPES(cls):
-#         return {
-#             "required": {
-#                 "ApiConfigure": ("ApiConfigure", {"forceInput": True}),
-#             }
-#         }
-
-#     # 改成 STRING，右侧会渲染成多行文本框
-#     RETURN_TYPES = ("STRING",)
-#     FUNCTION     = "process"
-#     CATEGORY     = CATEGORY
-
-#     def process(self, ApiConfigure):
-#         url, headers = _prepare_request(ApiConfigure, "list_speakers")
-#         try:
-#             resp = requests.get(url, headers=headers, timeout=(3, 15))
-#             resp.raise_for_status()
-#             speakers = resp.json().get("speakers", [])
-#             print(f"[Speakers] raw list: {repr(speakers)}")
-#         except Exception as e:
-#             print(f"[Speakers] 请求异常: {e}")
-#             speakers = []
-
-#         # 用换行拼接，每个说话人占一行
-#         text = "\n".join(speakers) or "（没有发现任何说话人）"
-#         return (text,)
-
-# class NCEHeygem2apiGenSpeaker:
-#     @classmethod
-#     def INPUT_TYPES(cls):
-#         return {
-#             "required": {
-#                 "ApiConfigure": ("ApiConfigure", {"forceInput": True}),
-#                 "audio":       ("AUDIO",       {"forceInput": True}),
-#                 "speaker":     ("STRING",      {"default": "nick"}),
-#                 "overwrite":   ("BOOLEAN",     {"default": False}),
-#                 "prompt":      ("STRING",      {"multiline": True}),
-#             }
-#         }
-
-#     RETURN_TYPES = ("STRING",)
-#     FUNCTION     = "process"
-#     CATEGORY     = CATEGORY
-
-#     def process(self, ApiConfigure, audio, speaker, overwrite, prompt):
-#         url, headers = _prepare_request(ApiConfigure, "register_speaker_upload")
-
-#         # dump AUDIO dict to a temp WAV file
-#         waveform    = audio["waveform"]  # [1, C, T]
-#         sample_rate = int(audio["sample_rate"])
-#         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-#         tmp_path = tmp.name; tmp.close()
-#         torchaudio.save(tmp_path, waveform.squeeze(0), sample_rate)
-
-#         files = {
-#             "wav_file": (
-#                 os.path.basename(tmp_path),
-#                 open(tmp_path, "rb"),
-#                 "audio/wav"
-#             )
-#         }
-#         data = {
-#             "speaker":     speaker,
-#             "prompt_text": prompt,
-#             "overwrite":   str(overwrite).lower()
-#         }
-
-#         try:
-#             resp = requests.post(url, headers=headers, data=data, files=files, timeout=(5, 300))
-#             resp.raise_for_status()
-#             return (resp.text,)
-#         except Exception as e:
-#             return (f"请求异常：{e}",)
-#         finally:
-#             try: os.unlink(tmp_path)
-#             except: pass
-
-
-
+        except Exception as e:
+            return (f"[UploadCharacter] 上传失败：{e}",)

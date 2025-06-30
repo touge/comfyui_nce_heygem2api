@@ -1,37 +1,43 @@
-# cache_audio.py
-
 import os
 import tempfile
-import torchaudio
 import torch
+import torchaudio
 import imageio
 import numpy as np
+import uuid
+from datetime import datetime
+import shutil
 
 
-def audio_to_tensor(
+def prepare_cache_dir(cache_dir: str):
+    """
+    确保 cache_dir 是一个全新的空目录：
+      1. 如果目录已存在，则删除整个目录及其所有内容
+      2. 然后重新创建该目录
+    """
+    if os.path.exists(cache_dir):
+        try:
+            shutil.rmtree(cache_dir)
+            print(f"[Heygem] 已删除旧缓存目录: {cache_dir}")
+        except Exception as e:
+            print(f"[Heygem] 删除缓存目录失败: {e}")
+            raise RuntimeError(f"无法清空缓存目录: {e}")
+
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        print(f"[Heygem] 成功创建缓存目录: {cache_dir}")
+    except OSError as e:
+        print(f"[Heygem] 创建缓存目录失败: {e}")
+        raise RuntimeError(f"无法创建缓存目录: {e}")
+    
+def cache_audio(
     cache_dir: str,
     audio_tensor: torch.Tensor,
     sample_rate: int,
     filename_prefix: str = "cached_audio_",
     audio_format: str = ".wav"
 ) -> str:
-    """
-    将一个音频 Tensor 缓存到磁盘，并返回生成的文件路径。
-
-    参数:
-      cache_dir       – 临时文件存放目录，会自动创建。
-      audio_tensor    – 应为 [channels, samples] 的 torch.Tensor。
-      sample_rate     – 音频采样率 (Hz)。
-      filename_prefix – 临时文件前缀 (默认 "cached_audio_")。
-      audio_format    – 文件后缀/格式 (默认 ".wav")。
-
-    返回:
-      写入磁盘后的临时文件绝对路径。
-
-    异常:
-      在无法写入文件或保存音频时，会抛出 RuntimeError。
-    """
-    os.makedirs(cache_dir, exist_ok=True)
+    # os.makedirs(cache_dir, exist_ok=True)
 
     try:
         with tempfile.NamedTemporaryFile(
@@ -45,11 +51,8 @@ def audio_to_tensor(
         if audio_tensor.device.type != "cpu":
             audio_tensor = audio_tensor.cpu()
 
-        # 🛠 修复点：降维到 [channels, samples]
         if audio_tensor.ndim == 3:
-            # 假设为 [1, C, S] 形式（常见于 ComfyUI）
             audio_tensor = audio_tensor.squeeze(0)
-
         if audio_tensor.ndim != 2:
             raise ValueError(f"audio_tensor 维度应为 [channels, samples]，但当前为 {audio_tensor.shape}")
 
@@ -60,61 +63,106 @@ def audio_to_tensor(
     except (OSError, RuntimeError, ValueError) as e:
         raise RuntimeError(f"Error caching audio tensor: {e}") from e
 
-def video_to_tensor(video_path: str) -> torch.Tensor:
-    """
-    读取本地视频文件并转为 torch.Tensor 格式，RGB，float32，[0, 1]。
-
-    参数:
-      video_path – 本地 mp4 文件路径。
-
-    返回:
-      Tensor: [frames, height, width, channels]，dtype=torch.float32
-
-    异常:
-      - FileNotFoundError：文件不存在
-      - RuntimeError：读取失败或格式异常
-    """
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"[video_to_tensor] 找不到视频文件: {video_path}")
-
-    reader = imageio.get_reader(video_path)
+def cache_video_bytes(
+    video_bytes: bytes,
+    cache_dir: str,
+    filename_prefix: str = "cached_video_",
+    video_format: str = ".mp4"
+) -> str:
+    # os.makedirs(cache_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    uid = str(uuid.uuid4())[:8]
+    filename = f"{filename_prefix}{timestamp}_{uid}{video_format}"
+    file_path = os.path.join(cache_dir, filename)
     try:
+        with open(file_path, "wb") as f:
+            f.write(video_bytes)
+        print(f"[cache_video_bytes] 视频已保存到: {file_path}")
+    except Exception as e:
+        raise RuntimeError(f"[cache_video_bytes] 视频保存失败: {e}") from e
+
+    return file_path
+
+
+def video_to_tensor(video_path):
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+
+    reader = None
+    try:
+        reader = imageio.get_reader(video_path)
         meta = reader.get_meta_data()
-        height, width = meta["size"]
-        expected_channels = 3
 
-        expected_shape = (height, width, expected_channels)
+        width, height = meta['size']
+        channels = 3
 
-        def frame_generator(reader, expected_shape):
-            for i, frame in enumerate(reader):
-                if frame.ndim == 2:
-                    print(f"[video_to_tensor] 第 {i} 帧为灰度图像 shape={frame.shape}，跳过。")
-                    continue
-                if frame.shape[-1] == 1:
-                    print(f"[video_to_tensor] 第 {i} 帧通道为 1，跳过: shape={frame.shape}")
-                    continue
-                if frame.shape[-1] == 4:
-                    frame = frame[:, :, :3]  # 去除 alpha 通道
+        def frame_processor_generator(imgio_reader, expected_shape):
+            for i, frame in enumerate(imgio_reader):
+                if frame.shape[-1] == 4 and expected_shape[-1] == 3:
+                     frame = frame[:, :, :3]
                 if frame.shape != expected_shape:
-                    print(f"[video_to_tensor] 第 {i} 帧尺寸异常，跳过: shape={frame.shape}, 预期: {expected_shape}")
+                    print(f"Warning: Frame {i} has unexpected shape {frame.shape}. Expected {expected_shape}. Skipping.")
                     continue
-                yield (frame.astype(np.float32) / 255.0)
 
-        frames = list(frame_generator(reader, expected_shape))
-        if len(frames) == 0:
-            raise RuntimeError(f"[video_to_tensor] 无法从 '{video_path}' 中读取任何有效帧")
+                frame_processed = (frame.astype(np.float32) / 255.0)
+
+                yield frame_processed
+
+        frame_shape = (height, width, channels)
+        gen_instance = frame_processor_generator(reader, frame_shape)
+
+        frames_np_flat = np.fromiter(
+            gen_instance,
+            np.dtype((np.float32, frame_shape))
+        )
+
+        num_loaded_frames = len(frames_np_flat)
+
+        if num_loaded_frames == 0:
+            reader.close()
+            raise RuntimeError(f"Failed to load any frames from video '{video_path}'. Check video file.")
+
+        frame_shape = (height, width, channels)
+        gen_instance = frame_processor_generator(reader, frame_shape)
+
+        frames_structured_np = np.fromiter(
+            gen_instance,
+            dtype=np.dtype((np.float32, frame_shape))
+        )
+        print(f"Finished reading frames. Structured numpy array shape: {frames_structured_np.shape}, dtype: {frames_structured_np.dtype}")
+
+        num_loaded_frames = len(frames_structured_np)
+
+        if num_loaded_frames == 0:
+            reader.close()
+            raise RuntimeError(f"Failed to load any frames from video '{video_path}'. Check video file or its content.")
+
+        total_scalars = num_loaded_frames * height * width * channels
+        try:
+            if frames_structured_np.size * frames_structured_np.dtype.itemsize != total_scalars * np.dtype(np.float32).itemsize:
+                 pass
+
+            frames_np = frames_structured_np.view(np.float32).reshape(-1, height, width, channels)
+            print(f"Reshaped numpy array shape: {frames_np.shape}, dtype: {frames_np.dtype}")
+
+        except Exception as reshape_e:
+            print(f"Error reshaping numpy array after fromiter: {reshape_e}")
+            reader.close()
+            raise RuntimeError(f"Failed to reshape frame data loaded from '{video_path}'. Likely mismatch in expected frame dimensions or data.") from reshape_e
 
         try:
-            frames_np = np.stack(frames, axis=0).copy()
-        except Exception as stack_err:
-            raise RuntimeError(f"[video_to_tensor] np.stack 出错: {stack_err}") from stack_err
+            tensor = torch.from_numpy(frames_np)
+            print("Tensor conversion successful.")
+        except Exception as tensor_e:
+            print(f"Error converting numpy array to torch tensor: {tensor_e}")
+            reader.close()
+            raise RuntimeError(f"Failed to convert numpy array to torch tensor for '{video_path}'. Likely out of memory.") from tensor_e
 
-        try:
-            tensor = torch.from_numpy(frames_np).to(torch.float32)
-        except Exception as tensor_err:
-            raise RuntimeError(f"[video_to_tensor] 转换为 tensor 失败: {tensor_err}") from tensor_err
-
-        return tensor
-
-    finally:
         reader.close()
+
+        print(f"Successfully loaded video '{video_path}' into tensor with shape {tensor.shape}.")
+        return tensor
+    except Exception as e:
+        if reader is not None:
+            reader.close()
+        raise RuntimeError(f"Failed to read video '{video_path}': {e}") from e
