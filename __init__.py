@@ -9,14 +9,14 @@ NODE_CONFIG = {
         "class": NCEHeygemGenerateVideo,
         "name": "视频生成",
     },
-    # "NCEHeygem2apiGenSpeaker": {
-    #     "class": NCEHeygem2apiGenSpeaker,
-    #     "name": "上传模特",
-    # },
-    # "NCEHeygem2apiSpeakers": {
-    #     "class": NCEHeygem2apiSpeakers,
-    #     "name": "模特列表",
-    # },  
+    "NCEHeygemUploadCharacter": {
+        "class": NCEHeygemUploadCharacter,
+        "name": "上传模特",
+    },
+    "NCEHeygemCharacters": {
+        "class": NCEHeygemCharacters,
+        "name": "模特列表",
+    },  
 }
 
 def generate_node_mappings(node_config):
