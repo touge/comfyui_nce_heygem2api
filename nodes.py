@@ -21,7 +21,7 @@ class NCEHeygemConfigure:
         return {
             "required": {
                 "api_host": ("STRING", {"default": "http://192.168.0.253"}),
-                "api_port": ("INT", {"default": 8001, "min": 1, "max": 65535}),
+                "api_port": ("INT", {"default": 8003, "min": 1, "max": 65535}),
                 "api_key":  ("STRING", {"default": "your-secret-key"}),
             }
         }
